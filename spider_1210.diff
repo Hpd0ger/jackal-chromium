@@ -1,0 +1,332 @@
+diff --git a/third_party/blink/renderer/core/frame/dom_window.h b/third_party/blink/renderer/core/frame/dom_window.h
+index f369c7dd03..eaff51f74b 100644
+--- a/third_party/blink/renderer/core/frame/dom_window.h
++++ b/third_party/blink/renderer/core/frame/dom_window.h
+@@ -111,6 +111,10 @@ class CORE_EXPORT DOMWindow : public WindowProperties, public DOMOriginUtils {
+   DOMWindow* parent() const;
+   DOMWindow* top() const;
+ 
++  // Security research: location_release controls navigation permission
++  bool locationRelease() const { return location_release_; }
++  void setLocationRelease(bool value) { location_release_ = value; }
++
+   void focus(v8::Isolate*);
+   void blur();
+   void close(v8::Isolate*);
+@@ -222,6 +226,10 @@ class CORE_EXPORT DOMWindow : public WindowProperties, public DOMOriginUtils {
+   // implementation details to scripts.
+   bool window_is_closing_;
+ 
++  // Security research: Controls whether navigation is allowed.
++  // When false, all navigation attempts via location will be blocked.
++  bool location_release_ = false;
++
+   // Cross-Origin-Opener-Policy (COOP):
+   // Check accesses made toward this window from |accessing_main_frame|. If this
+   // happens a report will sent to |reporter|.
+diff --git a/third_party/blink/renderer/core/frame/location.cc b/third_party/blink/renderer/core/frame/location.cc
+index 78cd3c4ba8..26a4f02e7d 100644
+--- a/third_party/blink/renderer/core/frame/location.cc
++++ b/third_party/blink/renderer/core/frame/location.cc
+@@ -28,14 +28,18 @@
+ 
+ #include "third_party/blink/renderer/core/frame/location.h"
+ 
++#include "base/functional/bind.h"
+ #include "third_party/blink/renderer/bindings/core/v8/binding_security.h"
++#include "third_party/blink/renderer/platform/wtf/functional.h"
+ #include "third_party/blink/renderer/bindings/core/v8/v8_binding_for_core.h"
+ #include "third_party/blink/renderer/core/dom/document.h"
++#include "third_party/blink/renderer/core/execution_context/execution_context.h"
+ #include "third_party/blink/renderer/core/frame/csp/content_security_policy.h"
+ #include "third_party/blink/renderer/core/frame/dom_window.h"
+ #include "third_party/blink/renderer/core/frame/local_dom_window.h"
+ #include "third_party/blink/renderer/core/frame/local_frame.h"
+ #include "third_party/blink/renderer/core/frame/remote_dom_window.h"
++#include "third_party/blink/renderer/core/inspector/console_message.h"
+ #include "third_party/blink/renderer/core/loader/frame_load_request.h"
+ #include "third_party/blink/renderer/core/loader/frame_loader.h"
+ #include "third_party/blink/renderer/core/url/dom_origin.h"
+@@ -43,10 +47,16 @@
+ #include "third_party/blink/renderer/platform/bindings/exception_state.h"
+ #include "third_party/blink/renderer/platform/bindings/v8_dom_activity_logger.h"
+ #include "third_party/blink/renderer/platform/bindings/v8_dom_wrapper.h"
++#include "third_party/blink/renderer/platform/heap/persistent.h"
+ #include "third_party/blink/renderer/platform/weborigin/kurl.h"
+ #include "third_party/blink/renderer/platform/weborigin/security_origin.h"
+ #include "third_party/blink/renderer/platform/wtf/text/strcat.h"
+ 
++namespace {
++// Interval for checking locationRelease status (in milliseconds)
++constexpr base::TimeDelta kLocationReleaseCheckInterval = base::Milliseconds(100);
++}
++
+ namespace blink {
+ 
+ Location::Location(DOMWindow* dom_window) : dom_window_(dom_window) {}
+@@ -77,6 +87,7 @@ v8::Local<v8::Value> Location::Wrap(ScriptState* script_state) {
+ 
+ void Location::Trace(Visitor* visitor) const {
+   visitor->Trace(dom_window_);
++  visitor->Trace(pending_navigation_);
+   ScriptWrappable::Trace(visitor);
+ }
+ 
+@@ -253,11 +264,38 @@ void Location::reload() {
+     return;
+   if (GetDocument()->Url().ProtocolIsJavaScript())
+     return;
+-  // reload() is not cross-origin accessible, so |dom_window_| will always be
+-  // local.
+-  To<LocalDOMWindow>(dom_window_.Get())
+-      ->GetFrame()
+-      ->Reload(WebFrameLoadType::kReload);
++
++  // Security research: If locationRelease is true, reload immediately
++  if (dom_window_->locationRelease()) {
++    // reload() is not cross-origin accessible, so |dom_window_| will always be
++    // local.
++    To<LocalDOMWindow>(dom_window_.Get())
++        ->GetFrame()
++        ->Reload(WebFrameLoadType::kReload);
++    return;
++  }
++
++  // Security research: Store pending reload and wait for locationRelease
++  pending_navigation_ = MakeGarbageCollected<PendingNavigation>();
++  pending_navigation_->url = GetDocument()->Url();
++  pending_navigation_->has_user_gesture = false;
++  pending_navigation_->frame_load_type = WebFrameLoadType::kReload;
++
++  if (!waiting_for_release_) {
++    waiting_for_release_ = true;
++
++    // Security research: Log to console that we're waiting for locationRelease
++    auto* local_window = DynamicTo<LocalDOMWindow>(dom_window_.Get());
++    if (local_window) {
++      local_window->AddConsoleMessage(
++          MakeGarbageCollected<ConsoleMessage>(
++              mojom::blink::ConsoleMessageSource::kJavaScript,
++              mojom::blink::ConsoleMessageLevel::kInfo,
++              "detect window location, wait locationRelease"));
++    }
++
++    ScheduleLocationReleaseCheck();
++  }
+ }
+ 
+ void Location::SetLocation(const String& url,
+@@ -310,17 +348,45 @@ void Location::SetLocation(const String& url,
+                               "blinkSetAttribute", argv);
+   }
+ 
+-  ResourceRequestHead resource_request(completed_url);
+-  resource_request.SetHasUserGesture(
+-      LocalFrame::HasTransientUserActivation(incumbent_window->GetFrame()));
+-
+-  FrameLoadRequest request(incumbent_window, resource_request);
+-  request.SetClientNavigationReason(ClientNavigationReason::kFrameNavigation);
++  bool has_user_gesture =
++      LocalFrame::HasTransientUserActivation(incumbent_window->GetFrame());
+   WebFrameLoadType frame_load_type = WebFrameLoadType::kStandard;
+   if (set_location_policy == SetLocationPolicy::kReplaceThisFrame)
+     frame_load_type = WebFrameLoadType::kReplaceCurrentItem;
+ 
+-  dom_window_->GetFrame()->Navigate(request, frame_load_type);
++  // Security research: If locationRelease is true, navigate immediately
++  if (dom_window_->locationRelease()) {
++    ResourceRequestHead resource_request(completed_url);
++    resource_request.SetHasUserGesture(has_user_gesture);
++
++    FrameLoadRequest request(incumbent_window, resource_request);
++    request.SetClientNavigationReason(ClientNavigationReason::kFrameNavigation);
++
++    dom_window_->GetFrame()->Navigate(request, frame_load_type);
++    return;
++  }
++
++  // Security research: Store pending navigation and wait for locationRelease
++  pending_navigation_ = MakeGarbageCollected<PendingNavigation>();
++  pending_navigation_->url = completed_url;
++  pending_navigation_->has_user_gesture = has_user_gesture;
++  pending_navigation_->frame_load_type = frame_load_type;
++
++  if (!waiting_for_release_) {
++    waiting_for_release_ = true;
++
++    // Security research: Log to console that we're waiting for locationRelease
++    auto* local_window = DynamicTo<LocalDOMWindow>(dom_window_.Get());
++    if (local_window) {
++      local_window->AddConsoleMessage(
++          MakeGarbageCollected<ConsoleMessage>(
++              mojom::blink::ConsoleMessageSource::kJavaScript,
++              mojom::blink::ConsoleMessageLevel::kInfo,
++              "detect window location, wait locationRelease"));
++    }
++
++    ScheduleLocationReleaseCheck();
++  }
+ }
+ 
+ Document* Location::GetDocument() const {
+@@ -331,4 +397,65 @@ bool Location::IsAttached() const {
+   return dom_window_->GetFrame();
+ }
+ 
++void Location::ScheduleLocationReleaseCheck() {
++  if (!IsAttached())
++    return;
++
++  auto* local_window = DynamicTo<LocalDOMWindow>(dom_window_.Get());
++  if (!local_window)
++    return;
++
++  ExecutionContext* context = local_window->GetExecutionContext();
++  if (!context)
++    return;
++
++  context->GetTaskRunner(TaskType::kInternalDefault)
++      ->PostDelayedTask(
++          FROM_HERE,
++          BindOnce(&Location::ExecutePendingNavigation,
++                   WrapWeakPersistent(this)),
++          kLocationReleaseCheckInterval);
++}
++
++void Location::ExecutePendingNavigation() {
++  // Check if we still have a valid pending navigation
++  if (!pending_navigation_ || !IsAttached()) {
++    waiting_for_release_ = false;
++    pending_navigation_ = nullptr;
++    return;
++  }
++
++  // Check if locationRelease is now true
++  if (dom_window_->locationRelease()) {
++    auto* local_window = DynamicTo<LocalDOMWindow>(dom_window_.Get());
++    if (!local_window) {
++      waiting_for_release_ = false;
++      pending_navigation_ = nullptr;
++      return;
++    }
++
++    // Handle reload case
++    if (pending_navigation_->frame_load_type == WebFrameLoadType::kReload) {
++      local_window->GetFrame()->Reload(WebFrameLoadType::kReload);
++    } else {
++      // Handle normal navigation
++      ResourceRequestHead resource_request(pending_navigation_->url);
++      resource_request.SetHasUserGesture(pending_navigation_->has_user_gesture);
++
++      FrameLoadRequest request(local_window, resource_request);
++      request.SetClientNavigationReason(ClientNavigationReason::kFrameNavigation);
++
++      dom_window_->GetFrame()->Navigate(request, pending_navigation_->frame_load_type);
++    }
++
++    // Clear pending navigation
++    waiting_for_release_ = false;
++    pending_navigation_ = nullptr;
++    return;
++  }
++
++  // locationRelease is still false, schedule another check
++  ScheduleLocationReleaseCheck();
++}
++
+ }  // namespace blink
+diff --git a/third_party/blink/renderer/core/frame/location.h b/third_party/blink/renderer/core/frame/location.h
+index 2071aea94c..d97c632488 100644
+--- a/third_party/blink/renderer/core/frame/location.h
++++ b/third_party/blink/renderer/core/frame/location.h
+@@ -29,11 +29,14 @@
+ #ifndef THIRD_PARTY_BLINK_RENDERER_CORE_FRAME_LOCATION_H_
+ #define THIRD_PARTY_BLINK_RENDERER_CORE_FRAME_LOCATION_H_
+ 
++#include "third_party/blink/public/platform/task_type.h"
+ #include "third_party/blink/renderer/bindings/core/v8/script_value.h"
+ #include "third_party/blink/renderer/core/core_export.h"
+ #include "third_party/blink/renderer/core/dom/dom_string_list.h"
+ #include "third_party/blink/renderer/core/frame/dom_window.h"
++#include "third_party/blink/renderer/core/loader/frame_loader_types.h"
+ #include "third_party/blink/renderer/platform/bindings/script_wrappable.h"
++#include "third_party/blink/renderer/platform/weborigin/kurl.h"
+ #include "third_party/blink/renderer/platform/wtf/text/wtf_string.h"
+ 
+ namespace blink {
+@@ -113,7 +116,28 @@ class CORE_EXPORT Location final : public ScriptWrappable {
+ 
+   const KURL& Url() const;
+ 
++  // Security research: Pending navigation data structure
++  struct PendingNavigation : public GarbageCollected<PendingNavigation> {
++    KURL url;
++    bool has_user_gesture;
++    WebFrameLoadType frame_load_type;
++
++    void Trace(Visitor* visitor) const {}
++  };
++
++  // Security research: Execute pending navigation when locationRelease becomes true
++  void ExecutePendingNavigation();
++
++  // Security research: Schedule a check for locationRelease
++  void ScheduleLocationReleaseCheck();
++
+   const Member<DOMWindow> dom_window_;
++
++  // Security research: Store pending navigation request
++  Member<PendingNavigation> pending_navigation_;
++
++  // Security research: Track if we're waiting for locationRelease
++  bool waiting_for_release_ = false;
+ };
+ 
+ }  // namespace blink
+diff --git a/third_party/blink/renderer/core/frame/navigator.cc b/third_party/blink/renderer/core/frame/navigator.cc
+index f8e3bb7712..4238b884eb 100644
+--- a/third_party/blink/renderer/core/frame/navigator.cc
++++ b/third_party/blink/renderer/core/frame/navigator.cc
+@@ -105,12 +105,8 @@ bool Navigator::cookieEnabled() const {
+ }
+ 
+ bool Navigator::webdriver() const {
+-  if (RuntimeEnabledFeatures::AutomationControlledEnabled())
+-    return true;
+-
+-  bool automation_enabled = false;
+-  probe::ApplyAutomationOverride(GetExecutionContext(), automation_enabled);
+-  return automation_enabled;
++  // Security research: Always return false to hide webdriver detection
++  return false;
+ }
+ 
+ String Navigator::GetAcceptLanguages() {
+diff --git a/third_party/blink/renderer/core/frame/navigator_automation_information.idl b/third_party/blink/renderer/core/frame/navigator_automation_information.idl
+index 909497fe5a..97e403b3b8 100644
+--- a/third_party/blink/renderer/core/frame/navigator_automation_information.idl
++++ b/third_party/blink/renderer/core/frame/navigator_automation_information.idl
+@@ -4,6 +4,7 @@
+ 
+ // https://w3c.github.io/webdriver/#interface
+ 
++// Security research: Disabled webdriver attribute to hide automation detection
+ interface mixin NavigatorAutomationInformation {
+-    readonly attribute boolean webdriver;
++    // readonly attribute boolean webdriver;
+ };
+diff --git a/third_party/blink/renderer/core/frame/window.idl b/third_party/blink/renderer/core/frame/window.idl
+index dd50e40e7e..46427b90d7 100644
+--- a/third_party/blink/renderer/core/frame/window.idl
++++ b/third_party/blink/renderer/core/frame/window.idl
+@@ -41,6 +41,10 @@
+     [LegacyUnforgeable, CachedAccessor=kWindowDocument] readonly attribute Document document;
+     attribute DOMString name;
+     [PutForwards=href, LegacyUnforgeable, CrossOrigin=(Getter,Setter), Measure] readonly attribute Location location;
++
++    // Security research: Controls whether navigation via location is allowed.
++    // When false (default), navigation will be blocked. Set to true to allow navigation.
++    attribute boolean locationRelease;
+     [CallWith=ScriptState] readonly attribute CustomElementRegistry customElements;
+     readonly attribute History history;
+     [Replaceable] readonly attribute Navigation navigation;
