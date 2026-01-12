@@ -36,7 +36,7 @@ git checkout ca233edc6900705165eeb4c652bbae2486de34fd
 git apply /path/to/spider_version/spider_datetime.diff
 # 复制args.gn到项目文件夹中, 按需更改
 gn args out/Release
-cp /path/to/chrome/spider_version/args.gn ./out/Release/
+cp /path/to/chrome/spider_version/args.gn ./out/Default/
 # 生产编译文件
 gn gen out/Release
 # 开始编译
